@@ -8,12 +8,13 @@ const { HttpProxyAgent } = require('http-proxy-agent');
 // Constants
 const IPTV_CHANNELS_URL = 'https://iptv-org.github.io/api/channels.json';
 const IPTV_STREAMS_URL = 'https://iptv-org.github.io/api/streams.json';
+const M3U_PLAYLIST_URL = process.env.M3U_PLAYLIST_URL || '';  // NEW: M3U playlist URL
 const PORT = process.env.PORT || 3000;
-const FETCH_INTERVAL = parseInt(process.env.FETCH_INTERVAL) || 86400000; // Fetch interval in milliseconds, default 1 day
-const PROXY_URL = process.env.PROXY_URL || ''; // Proxy URL for verification
-const FETCH_TIMEOUT = parseInt(process.env.FETCH_TIMEOUT) || 10000; // Fetch timeout in milliseconds, default 10 seconds
+const FETCH_INTERVAL = parseInt(process.env.FETCH_INTERVAL) || 86400000; // 1 day
+const PROXY_URL = process.env.PROXY_URL || '';
+const FETCH_TIMEOUT = parseInt(process.env.FETCH_TIMEOUT) || 10000;
 
-// Configuration for channel filtering.
+// Config (same as before)
 const config = {
     includeLanguages: process.env.INCLUDE_LANGUAGES ? process.env.INCLUDE_LANGUAGES.split(',') : [],
     includeCountries: process.env.INCLUDE_COUNTRIES ? process.env.INCLUDE_COUNTRIES.split(',') : ['GR'],
@@ -27,13 +28,13 @@ const app = express();
 app.use(express.json());
 
 // Cache setup
-const cache = new NodeCache({ stdTTL: 0 }); // Set stdTTL to 0 for infinite TTL
+const cache = new NodeCache({ stdTTL: 0 });
 
-// Addon Manifest
+// Addon Manifest (unchanged)
 const manifest = {
     id: 'org.iptv',
     name: 'IPTV Addon',
-    version: '0.0.2',
+    version: '0.0.3',
     description: `Watch live TV from ${config.includeCountries.join(', ')}`,
     resources: ['catalog', 'meta', 'stream'],
     types: ['tv'],
@@ -45,37 +46,11 @@ const manifest = {
             {
                 name: 'genre',
                 isRequired: false,
-                "options": [
-                    "animation",
-                    "business",
-                    "classic",
-                    "comedy",
-                    "cooking",
-                    "culture",
-                    "documentary",
-                    "education",
-                    "entertainment",
-                    "family",
-                    "kids",
-                    "legislative",
-                    "lifestyle",
-                    "movies",
-                    "music",
-                    "general",
-                    "religious",
-                    "news",
-                    "outdoor",
-                    "relax",
-                    "series",
-                    "science",
-                    "shop",
-                    "sports",
-                    "travel",
-                    "weather",
-                    "xxx",
-                    "auto"
+                options: [
+                    "animation", "business", "classic", "comedy", "cooking", "culture", "documentary", "education",
+                    "entertainment", "family", "kids", "legislative", "lifestyle", "movies", "music", "general",
+                    "religious", "news", "outdoor", "relax", "series", "science", "shop", "sports", "travel", "weather", "xxx", "auto"
                 ]
-
             }
         ],
     })),
@@ -88,21 +63,73 @@ const manifest = {
 
 const addon = new addonBuilder(manifest);
 
-// Helper Functions
+// Helper: Parse M3U playlist text
+function parseM3U(data) {
+    const lines = data.split(/\r?\n/);
+    const channels = [];
+    for (let i = 0; i < lines.length; i++) {
+        if (lines[i].startsWith('#EXTINF')) {
+            const infoLine = lines[i];
+            const urlLine = lines[i + 1] || '';
 
-// Convert channel to Stremio accepted Meta object
-const toMeta = (channel) => ({
+            // Extract attributes from EXTINF line
+            const nameMatch = infoLine.match(/,(.*)$/);
+            const name = nameMatch ? nameMatch[1].trim() : 'Unknown';
+
+            const tvgIdMatch = infoLine.match(/tvg-id="([^"]*)"/);
+            const tvgId = tvgIdMatch ? tvgIdMatch[1].trim() : null;
+
+            const logoMatch = infoLine.match(/tvg-logo="([^"]*)"/);
+            const logo = logoMatch ? logoMatch[1].trim() : null;
+
+            const groupMatch = infoLine.match(/group-title="([^"]*)"/);
+            const group = groupMatch ? groupMatch[1].trim() : null;
+
+            channels.push({
+                id: tvgId || name.toLowerCase().replace(/\W+/g, '-'),
+                name,
+                logo,
+                categories: group ? [group.toLowerCase()] : [],
+                country: '',          // M3U doesn’t provide country, set empty or parse if you want
+                languages: [],        // No language info in M3U, can be empty or default
+                streamUrl: urlLine.trim()
+            });
+            i++; // skip next line as it's stream url
+        }
+    }
+    return channels;
+}
+
+// Convert parsed M3U channel to Meta for Stremio
+const m3uToMeta = (channel) => ({
     id: `iptv-${channel.id}`,
     name: channel.name,
     type: 'tv',
-    genres: [...(channel.categories || []), channel.country].filter(Boolean),
+    genres: [...(channel.categories || [])],
     poster: channel.logo,
     posterShape: 'square',
     background: channel.logo || null,
     logo: channel.logo || null,
 });
 
-// Fetch and filter channels
+// Fetch M3U playlist and parse
+const getM3UChannels = async () => {
+    if (!M3U_PLAYLIST_URL) return [];
+    if (cache.has('m3uChannels')) {
+        return cache.get('m3uChannels');
+    }
+    try {
+        const response = await axios.get(M3U_PLAYLIST_URL, { timeout: FETCH_TIMEOUT });
+        const channels = parseM3U(response.data);
+        cache.set('m3uChannels', channels);
+        return channels;
+    } catch (err) {
+        console.error('Failed to fetch or parse M3U playlist:', err.message);
+        return [];
+    }
+};
+
+// Fetch IPTV JSON data (unchanged)
 const getChannels = async () => {
     console.log("Downloading channels");
     try {
@@ -111,16 +138,14 @@ const getChannels = async () => {
         return channelsResponse.data;
     } catch (error) {
         console.error('Error fetching channels:', error);
-        // If we fail to get new channels, serve from cache
         if (cache.has('channels')) {
             console.log('Serving channels from cache');
             return cache.get('channels');
         }
-        return null;
+        return [];
     }
 };
 
-// Fetch Stream Info for the Channel
 const getStreamInfo = async () => {
     if (!cache.has('streams')) {
         console.log("Downloading streams data");
@@ -135,7 +160,7 @@ const getStreamInfo = async () => {
     return cache.get('streams');
 };
 
-// Verify stream URL
+// Verify stream URL (unchanged)
 const verifyStreamURL = async (url, userAgent, httpReferrer) => {
     const cachedResult = cache.get(url);
     if (cachedResult !== undefined) {
@@ -144,13 +169,6 @@ const verifyStreamURL = async (url, userAgent, httpReferrer) => {
 
     const effectiveUserAgent = userAgent || 'Mozilla/5.0 (Web0S; Linux/SmartTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.79 Safari/537.36 DMOST/2.0.0 (; LGE; webOSTV; WEBOS6.3.2 03.34.95; W6_lm21a;)';
     const effectiveReferer = httpReferrer || '';
-
-    if (effectiveUserAgent !== 'Mozilla/5.0 (Web0S; Linux/SmartTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.79 Safari/537.36 DMOST/2.0.0 (; LGE; webOSTV; WEBOS6.3.2 03.34.95; W6_lm21a;)') {
-        console.log(`Using User-Agent: ${effectiveUserAgent}`);
-    }
-    if (httpReferrer) {
-        console.log(`Using Referer: ${effectiveReferer}`);
-    }
 
     let axiosConfig = {
         timeout: FETCH_TIMEOUT,
@@ -175,127 +193,130 @@ const verifyStreamURL = async (url, userAgent, httpReferrer) => {
         cache.set(url, result);
         return result;
     } catch (error) {
-        console.log(`Stream URL verification failed for ${url}:`, error.message);
         cache.set(url, false);
         return false;
     }
 };
 
-// Get all channel information
+// Get all channel info (merged JSON + M3U)
 const getAllInfo = async () => {
-    if (cache.has('channelsInfo')) {
-        return cache.get('channelsInfo');
-    }
-
+    // Fetch JSON IPTV data
     const streams = await getStreamInfo();
     const channels = await getChannels();
 
-    if (!channels) {
-        console.log('Failed to fetch channels, using cached data if available');
-        return cache.get('channelsInfo') || [];
-    }
+    // Fetch M3U playlist channels
+    const m3uChannels = await getM3UChannels();
 
+    // Map JSON streams by channel id
     const streamMap = new Map(streams.map(stream => [stream.channel, stream]));
 
-    const filteredChannels = channels.filter((channel) => {
+    // Filter JSON channels
+    const filteredJsonChannels = channels.filter((channel) => {
         if (config.includeCountries.length > 0 && !config.includeCountries.includes(channel.country)) return false;
         if (config.excludeCountries.length > 0 && config.excludeCountries.includes(channel.country)) return false;
         if (config.includeLanguages.length > 0 && !channel.languages.some(lang => config.includeLanguages.includes(lang))) return false;
         if (config.excludeLanguages.length > 0 && channel.languages.some(lang => config.excludeLanguages.includes(lang))) return false;
-        if (config.excludeCategories.some(cat => channel.categories.includes(cat))) return false;
-        return streamMap.has(channel.id);
+        if (config.excludeCategories.length > 0 && channel.categories.some(cat => config.excludeCategories.includes(cat))) return false;
+        return true;
     });
 
-    const channelsWithDetails = await Promise.all(filteredChannels.map(async (channel) => {
-        const streamInfo = streamMap.get(channel.id);
-        if (streamInfo && await verifyStreamURL(streamInfo.url, streamInfo.user_agent, streamInfo.http_referrer)) {
-            const meta = toMeta(channel);
-            meta.streamInfo = {
-                url: streamInfo.url,
-                title: 'Live Stream',
-                httpReferrer: streamInfo.http_referrer
-            };
-            return meta;
-        }
-        return null;
-    }));
+    // Build final combined list: M3U channels + filtered JSON channels (remap JSON channels with stream info)
+    const jsonChannelsWithStreams = filteredJsonChannels.map(channel => {
+        const stream = streamMap.get(channel.id);
+        return {
+            id: channel.id,
+            name: channel.name,
+            logo: channel.logo,
+            categories: channel.categories,
+            country: channel.country,
+            languages: channel.languages,
+            streamUrl: stream ? stream.url : null,
+        };
+    }).filter(c => c.streamUrl);
 
-    const filteredChannelsInfo = channelsWithDetails.filter(Boolean);
-    cache.set('channelsInfo', filteredChannelsInfo);
+    // Combine and dedupe by id (M3U may overlap with JSON channels)
+    const allChannelsMap = new Map();
+    [...m3uChannels, ...jsonChannelsWithStreams].forEach(channel => {
+        allChannelsMap.set(channel.id, channel);
+    });
 
-    return filteredChannelsInfo;
+    return Array.from(allChannelsMap.values());
 };
 
-// Addon Handlers
-
-// Catalog Handler
+// Catalog handler
 addon.defineCatalogHandler(async ({ type, id, extra }) => {
-    if (type === 'tv' && id.startsWith('iptv-channels-')) {
-        const country = id.split('-')[2];
-        const allChannels = await getAllInfo();
-        let filteredChannels = allChannels.filter(channel => channel.genres.includes(country));
+    if (type !== 'tv') return { metas: [] };
 
-        if (extra && extra.genre) {
-            const genres = Array.isArray(extra.genre) ? extra.genre : [extra.genre];
-            filteredChannels = filteredChannels.filter(channel =>
-                genres.some(genre => channel.genres.includes(genre))
-            );
-        }
+    const allChannels = await getAllInfo();
 
-        console.log(`Serving catalog for ${country} with ${filteredChannels.length} channels`);
-        return { metas: filteredChannels };
+    let filtered = allChannels;
+
+    // Filter by genre if requested
+    if (extra && extra.genre) {
+        filtered = filtered.filter(c => c.categories && c.categories.includes(extra.genre.toLowerCase()));
     }
-    return { metas: [] };
+
+    // Filter by country from catalog id (e.g. iptv-channels-GR)
+    if (id && id.startsWith('iptv-channels-')) {
+        const countryCode = id.split('-').pop().toUpperCase();
+        filtered = filtered.filter(c => c.country.toUpperCase() === countryCode);
+    }
+
+    // Convert to Stremio meta format
+    const metas = filtered.map(m3uToMeta);
+
+    return { metas };
 });
 
-// Meta Handler
+// Meta handler
 addon.defineMetaHandler(async ({ type, id }) => {
-    if (type === 'tv' && id.startsWith('iptv-')) {
-        const channels = await getAllInfo();
-        const channel = channels.find((meta) => meta.id === id);
-        if (channel) {
-            return { meta: channel };
-        }
-    }
-    return { meta: {} };
+    if (!id.startsWith('iptv-')) return null;
+    const channelId = id.substring(5);
+
+    const allChannels = await getAllInfo();
+    const channel = allChannels.find(c => c.id === channelId);
+    if (!channel) return null;
+
+    return {
+        id,
+        type: 'tv',
+        name: channel.name,
+        genres: channel.categories,
+        poster: channel.logo,
+        background: channel.logo,
+        streams: [
+            {
+                url: channel.streamUrl,
+                title: channel.name,
+            }
+        ],
+    };
 });
 
-// Stream Handler
-addon.defineStreamHandler(async ({ type, id }) => {
-    if (type === 'tv' && id.startsWith('iptv-')) {
-        const channels = await getAllInfo();
-        const channel = channels.find((meta) => meta.id === id);
-        if (channel?.streamInfo) {
-            console.log("Serving stream id: ", channel.id);
-            return { streams: [channel.streamInfo] };
-        } else {
-            console.log('No matching stream found for channelID:', id);
-        }
-    }
-    return { streams: [] };
+// Stream handler
+addon.defineStreamHandler(async ({ type, id, extra }) => {
+    if (!id.startsWith('iptv-')) return { streams: [] };
+    const channelId = id.substring(5);
+
+    const allChannels = await getAllInfo();
+    const channel = allChannels.find(c => c.id === channelId);
+    if (!channel || !channel.streamUrl) return { streams: [] };
+
+    const isValid = await verifyStreamURL(channel.streamUrl, extra?.userAgent, extra?.httpReferrer);
+    if (!isValid) return { streams: [] };
+
+    return {
+        streams: [
+            {
+                title: channel.name,
+                url: channel.streamUrl,
+                isRemote: true,
+            }
+        ]
+    };
 });
 
-// Server setup
-app.get('/manifest.json', (req, res) => {
-    res.setHeader('Content-Type', 'application/json');
-    res.json(manifest);
+app.use('/', addon.getInterface());
+app.listen(PORT, () => {
+    console.log(`IPTV Addon listening on port ${PORT}`);
 });
-
-serveHTTP(addon.getInterface(), { server: app, path: '/manifest.json', port: PORT });
-
-
-// Cache management
-const fetchAndCacheInfo = async () => {
-    try {
-        const metas = await getAllInfo();
-        console.log(`${metas.length} channel(s) information cached successfully`);
-    } catch (error) {
-        console.error('Error caching channel information:', error);
-    }
-};
-
-// Initial fetch
-fetchAndCacheInfo();
-
-// Schedule fetch based on FETCH_INTERVAL
-setInterval(fetchAndCacheInfo, FETCH_INTERVAL);
